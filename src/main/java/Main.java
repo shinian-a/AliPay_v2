@@ -7,16 +7,22 @@ import com.alipay.api.response.AlipayDataBillAccountlogQueryResponse;
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpExchange;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Properties;
 
 /**
@@ -63,22 +69,108 @@ public class Main {
             // 初始化AlipayClient
             alipayClient = new DefaultAlipayClient(GATEWAY_URL, APP_ID, APP_PRIVATE_KEY, FORMAT, CHARSET, ALIPAY_PUBLIC_KEY, SIGN_TYPE);
 
-            // 创建HTTP服务器，监听8080端口
-            HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+            // 获取命令行参数中的端口号，默认为8080
+            int port = 8080;
+            if (args.length > 0) {
+                try {
+                    port = Integer.parseInt(args[0]);
+                } catch (NumberFormatException e) {
+                    System.err.println("无效的端口号参数: " + args[0] + "，将使用默认端口8080");
+                }
+            }
+
+            // 创建HTTP服务器，监听指定端口
+            HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+
             // 注册余额查询接口处理器
             server.createContext("/balance", new BalanceHandler());
             // 注册账单查询接口处理器
             server.createContext("/accountlog", new AccountLogHandler());
+            // 注册签名生成接口处理器
+            server.createContext("/sign", new SignHandler());
 
             server.setExecutor(null); // creates a default executor
             // 启动HTTP服务器
             server.start();
 
-            System.out.println("服务器已启动，监听端口 8080");
-            System.out.println("访问 http://localhost:8080/balance 查询支付宝余额");
-            System.out.println("访问 http://localhost:8080/accountlog 查询支付宝账单");
+            System.out.println("服务器已启动，监听端口 " + port);
+            System.out.println("访问 http://localhost:" + port + "/balance 查询支付宝余额");
+            System.out.println("访问 http://localhost:" + port + "/accountlog 查询支付宝账单");
+            System.out.println("访问 http://localhost:" + port + "/sign 生成签名");
+
         } catch (IOException e) {
+            System.err.println("启动服务器失败: " + e.getMessage());
             e.printStackTrace();
+        }
+    }
+
+    /**
+     * 解析表单数据
+     * @param formData 表单数据字符串
+     * @return 参数映射
+     */
+    private static Map<String, String> parseFormData(String formData) {
+        Map<String, String> params = new HashMap<>();
+        if (formData != null && !formData.isEmpty()) {
+            String[] pairs = formData.split("&");
+            for (String pair : pairs) {
+                String[] keyValue = pair.split("=", 2);
+                if (keyValue.length == 2) {
+                    try {
+                        String key = URLDecoder.decode(keyValue[0], "UTF-8");
+                        String value = URLDecoder.decode(keyValue[1], "UTF-8");
+                        params.put(key, value);
+                    } catch (Exception e) {
+                        // 解码失败则跳过该参数
+                    }
+                }
+            }
+        }
+        return params;
+    }
+
+    /**
+     * 签名生成处理器
+     * 钉钉签名算法
+     * 处理 /sign 路径的HTTP请求，根据动态提交的密钥生成签名
+     */
+    static class SignHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            try {
+                if ("POST".equals(exchange.getRequestMethod())) {
+                    // 获取请求体
+                    String requestBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+
+                    // 解析请求参数
+                    Map<String, String> params = parseFormData(requestBody);
+                    String secret = params.get("secret");
+
+                    if (secret == null || secret.isEmpty()) {
+                        sendResponse(exchange, "{\"error\":\"缺少secret参数\"}", 400);
+                        return;
+                    }
+
+                    // 生成签名
+                    Long timestamp = System.currentTimeMillis();
+                    String stringToSign = timestamp + "\n" + secret;
+                    Mac mac = Mac.getInstance("HmacSHA256");
+                    mac.init(new SecretKeySpec(secret.getBytes("UTF-8"), "HmacSHA256"));
+                    byte[] signData = mac.doFinal(stringToSign.getBytes("UTF-8"));
+                    String sign = java.net.URLEncoder.encode(new String(org.apache.commons.codec.binary.Base64.encodeBase64(signData)), "UTF-8");
+
+                    // 返回结果
+                    String response = "{" +
+                            "\"timestamp\":" + timestamp + "," +
+                            "\"sign\":\"" + sign + "\"" +
+                            "}";
+                    sendResponse(exchange, response, 200);
+                } else {
+                    sendResponse(exchange, "{\"error\":\"只支持POST方法\"}", 405);
+                }
+            } catch (Exception e) {
+                sendResponse(exchange, "{\"error\":\"生成签名失败: " + e.getMessage() + "\"}", 500);
+            }
         }
     }
 
@@ -186,7 +278,6 @@ public class Main {
         }
     }
 
-
     /**
      * 余额查询处理器
      * 处理 /balance 路径的HTTP请求
@@ -287,10 +378,10 @@ public class Main {
 
             String bizContent = "{" + "\"start_time\":\"" + sdf.format(weekAgo) + "\"," +//开始时间 7 天前
                     "\"end_time\":\"" + sdf.format(now) + "\"," +//结束时间 当前时间
-                    "\"page_no\":\"1\"," +//账单页
-                    "\"page_size\":\"20\"," +//账单个数
+                    "\"page_no\":\"1\"," +//分页号，从1开始（账单页）
+                    "\"page_size\":\"20\"," +//分页大小（账单个数）
                     "}";
-
+//                 "\"trans_code\":\"301101\"" + //业务类型101101,301101
             request.setBizContent(bizContent);
 
             // 执行API调用
@@ -298,7 +389,7 @@ public class Main {
 
             // 处理响应结果
             if (response.isSuccess()) {
-                return (response.getDetailList() != null ? "\"" + response.getBody() + "\"" : "null");
+                return (response.getDetailList() != null ? response.getBody() : "null");
             } else {
                 return "{" + "\"success\":false," + "\"errorCode\":\"" + response.getCode() + "\"," + "\"errorMsg\":\"" + response.getMsg() + "\"," + "\"subErrorCode\":\"" + response.getSubCode() + "\"," + "\"subErrorMsg\":\"" + response.getSubMsg() + "\"" + "}";
             }
@@ -306,5 +397,4 @@ public class Main {
             return "{" + "\"success\":false," + "\"errorCode\":\"EXCEPTION\"," + "\"errorMsg\":\"" + e.getMessage() + "\"" + "}";
         }
     }
-
 }
